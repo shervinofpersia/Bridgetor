@@ -9,36 +9,35 @@ RESET='\033[0m'
 clear
 echo -e "${ORANGE}[*] Checking prerequisites...${RESET}"
 
-# Auto-install Python if missing
 if ! command -v python &> /dev/null; then
     echo -e "${GRAY}[!] Python not found. Installing automatically...${RESET}"
     pkg update -y && pkg install python -y
 fi
 
-# Auto-request storage permission if not granted
 if [ ! -w "/storage/emulated/0/Download" ]; then
     echo -e "${ORANGE}[!] Requesting storage access... Please grant it on your phone popup.${RESET}"
     termux-setup-storage
     sleep 3
 fi
 
-# Execute embedded Python script
 python -c '
 import urllib.request
 import socket
 import re
-import os
+import sys
+import concurrent.futures
 
 # Terminal Colors
-O = "\033[38;5;208m" # Orange
-G = "\033[90m"       # Gray
-W = "\033[97m"       # White
-R = "\033[0m"        # Reset
+O = "\033[38;5;208m"
+G = "\033[90m"
+W = "\033[97m"
+R = "\033[0m"
 
+# Corrected Paths (added /bridge/ folder)
 SOURCES = [
-    "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/obfs4_tested.txt",
-    "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/webtunnel_tested.txt",
-    "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/vanilla_tested.txt"
+    "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/obfs4_tested.txt",
+    "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/webtunnel_tested.txt",
+    "https://raw.githubusercontent.com/Delta-Kronecker/Tor-Bridges-Collector/main/bridge/vanilla_tested.txt"
 ]
 
 OUTPUT_FILE = "/storage/emulated/0/Download/active_bridges.txt"
@@ -54,49 +53,67 @@ def fetch_bridges(url):
     print(f"{G}📥 Fetching {W}{b_type}{G} bridges...{R}")
     try:
         req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             return response.read().decode("utf-8")
     except Exception as e:
         print(f"{O}❌ Error fetching {b_type}: {e}{R}")
         return ""
 
-def test_tcp_connection(ip, port, timeout=5, retries=2):
-    for _ in range(retries):
-        try:
-            with socket.create_connection((ip, port), timeout=timeout):
-                return True
-        except (socket.timeout, socket.error):
-            continue
-    return False
+def test_connection(line):
+    match = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)\b", line)
+    if not match:
+        return None
+    ip, port = match.groups()
+    
+    # Fast 3-second test
+    try:
+        with socket.create_connection((ip, int(port)), timeout=3):
+            return line, ip, port
+    except:
+        return None
 
 def main():
     print_banner()
-    working_bridges = []
+    all_lines = []
     
     for source in SOURCES:
         data = fetch_bridges(source)
-        if not data:
-            continue
+        if data:
+            all_lines.extend([l.strip() for l in data.splitlines() if l.strip() and not l.startswith("#")])
 
-        b_type = source.split("/")[-1].replace("_tested.txt", "").upper()
-        print(f"{W}🔍 Testing {O}{b_type}{W} connections...{R}")
+    if not all_lines:
+        print(f"\n{O}⚠️ No bridges fetched. Please check your internet connection.{R}\n")
+        return
+
+    total = len(all_lines)
+    print(f"\n{W}🚀 Fetched {O}{total}{W} bridges. Starting Multi-Threaded tests...{R}\n")
+    
+    working_bridges = []
+    done_count = 0
+
+    # Multi-threading for maximum speed (40 concurrent threads)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:
+        futures = {executor.submit(test_connection, line): line for line in all_lines}
         
-        for line in data.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-                
-            match = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)\b", line)
-            if match:
-                ip, port = match.groups()
-                port = int(port)
-                
-                if test_tcp_connection(ip, port):
-                    print(f"{W}   [{O}ACTIVE{W}] {G}{ip}:{port}{R}")
-                    working_bridges.append(line)
+        for future in concurrent.futures.as_completed(futures):
+            done_count += 1
+            
+            # Dynamic Loading Indicator (\r\033[K clears the current line to prevent visual bugs)
+            sys.stdout.write(f"\r\033[K{G}⏳ Progress: [{O}{done_count}{G}/{total}] Testing in parallel...{R}")
+            sys.stdout.flush()
+            
+            result = future.result()
+            if result:
+                line, ip, port = result
+                working_bridges.append(line)
+                # Print the active bridge above the loading bar
+                sys.stdout.write(f"\r\033[K{W}   [{O}ACTIVE{W}] {G}{ip}:{port}{R}\n")
+                sys.stdout.write(f"\r\033[K{G}⏳ Progress: [{O}{done_count}{G}/{total}] Testing in parallel...{R}")
+                sys.stdout.flush()
 
-        print(f"{G}-------------------------------------------------{R}")
+    print(f"\r\033[K{G}-------------------------------------------------{R}")
 
+    # Output to Raw Text
     if working_bridges:
         try:
             with open(OUTPUT_FILE, "w") as f:
@@ -107,7 +124,7 @@ def main():
         except PermissionError:
             print(f"\n{O}❌ Error: Storage permission denied.{R}")
     else:
-        print(f"{O}⚠️ No active bridges found.{R}\n")
+        print(f"{O}⚠️ No active bridges found on your network.{R}\n")
 
 if __name__ == "__main__":
     main()
